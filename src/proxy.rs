@@ -3,16 +3,15 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
 };
 
+use anyhow::bail;
 use base64::{engine::general_purpose, Engine};
 use httparse::{Error as HttpParseError, Response, EMPTY_HEADER};
 use log::info;
 use thiserror::Error as ThisError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tokio_native_tls::{native_tls, TlsConnector, TlsStream};
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-use tokio_rustls::{client::TlsStream, TlsConnector};
-use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr};
+use tokio_rustls::{client::TlsStream as RustlsTlsStream, TlsConnector as RustlsTlsConnector};
+use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr, TargetAddr};
 use tokio_util::codec::Framed;
 use url::Url;
 
@@ -20,6 +19,7 @@ use crate::{
     bytes_codec::BytesCodec,
     config::Socks5Server,
     tcp::{DynTcpStream, FramedStream},
+    tls::{get_cached_tls_type, upsert_tls_type, TlsType},
     ResultType,
 };
 
@@ -45,7 +45,6 @@ pub enum ProxyError {
     HttpCode200(u16),
     #[error("The proxy address resolution failed: {0}")]
     AddressResolutionFailed(String),
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[error("The native tls error: {0}")]
     NativeTlsError(#[from] tokio_native_tls::native_tls::Error),
 }
@@ -349,7 +348,7 @@ impl Proxy {
     }
 
     pub async fn connect<'t, T>(
-        self,
+        &self,
         target: T,
         local_addr: Option<SocketAddr>,
     ) -> ResultType<FramedStream>
@@ -358,6 +357,10 @@ impl Proxy {
     {
         info!("Connect to proxy server");
         let proxy = self.proxy_addrs().await?;
+
+        let target_addr = target
+            .into_target_addr()
+            .map_err(|e| ProxyError::TargetParseError(e.to_string()))?;
 
         let local = if let Some(addr) = local_addr {
             addr
@@ -378,7 +381,8 @@ impl Proxy {
             ProxyScheme::Http { .. } => {
                 info!("Connect to remote http proxy server: {}", proxy);
                 let stream =
-                    super::timeout(self.ms_timeout, self.http_connect(stream, target)).await??;
+                    super::timeout(self.ms_timeout, self.http_connect(stream, &target_addr))
+                        .await??;
                 Ok(FramedStream(
                     Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
                     addr,
@@ -388,10 +392,59 @@ impl Proxy {
             }
             ProxyScheme::Https { .. } => {
                 info!("Connect to remote https proxy server: {}", proxy);
-                let stream =
-                    super::timeout(self.ms_timeout, self.https_connect(stream, target)).await??;
+                let url = format!("https://{}", self.intercept.get_host_and_port()?);
+                let tls_type = get_cached_tls_type(&url).unwrap_or(TlsType::NativeTls);
+                let ms_timeout = self.ms_timeout;
+                let stream = match tls_type {
+                    TlsType::NativeTls => {
+                        match super::timeout(
+                            ms_timeout,
+                            self.https_connect_nativetls(stream, &target_addr),
+                        )
+                        .await?
+                        {
+                            Ok(s) => {
+                                upsert_tls_type(&url, TlsType::NativeTls);
+                                DynTcpStream(Box::new(s))
+                            }
+                            Err(ProxyError::NativeTlsError(_)) => {
+                                log::warn!("Falling back to rustls for HTTPS proxy server.");
+                                let stream = super::timeout(
+                                    ms_timeout,
+                                    crate::tcp::new_socket(local, true)?.connect(proxy),
+                                )
+                                .await??;
+                                stream.set_nodelay(true).ok();
+                                let s = super::timeout(
+                                    ms_timeout,
+                                    self.https_connect_rustls(stream, &target_addr),
+                                )
+                                .await??;
+                                upsert_tls_type(&url, TlsType::Rustls);
+                                DynTcpStream(Box::new(s))
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to connect to HTTPS proxy server: {:?}.", e);
+                                bail!(e);
+                            }
+                        }
+                    }
+                    TlsType::Rustls => {
+                        let s = super::timeout(
+                            self.ms_timeout,
+                            self.https_connect_rustls(stream, &target_addr),
+                        )
+                        .await??;
+                        upsert_tls_type(&url, tls_type);
+                        DynTcpStream(Box::new(s))
+                    }
+                    _ => {
+                        // Unreachable
+                        crate::bail!("Unreachable, TlsType::Plain in HTTPS proxy");
+                    }
+                };
                 Ok(FramedStream(
-                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    Framed::new(stream, BytesCodec::new()),
                     addr,
                     None,
                     0,
@@ -404,7 +457,7 @@ impl Proxy {
                         self.ms_timeout,
                         Socks5Stream::connect_with_password_and_socket(
                             stream,
-                            target,
+                            target_addr,
                             &auth.user_name,
                             &auth.password,
                         ),
@@ -413,7 +466,7 @@ impl Proxy {
                 } else {
                     super::timeout(
                         self.ms_timeout,
-                        Socks5Stream::connect_with_socket(stream, target),
+                        Socks5Stream::connect_with_socket(stream, target_addr),
                     )
                     .await??
                 };
@@ -427,32 +480,28 @@ impl Proxy {
         };
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub async fn https_connect<'a, Input, T>(
-        self,
+    pub async fn https_connect_nativetls<'a, Input>(
+        &self,
         io: Input,
-        target: T,
+        target_addr: &TargetAddr<'a>,
     ) -> Result<BufStream<TlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
         let tls_connector = TlsConnector::from(native_tls::TlsConnector::new()?);
         let stream = tls_connector
             .connect(&self.intercept.get_domain()?, io)
             .await?;
-        self.http_connect(stream, target).await
+        self.http_connect(stream, target_addr).await
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    pub async fn https_connect<'a, Input, T>(
-        self,
+    pub async fn https_connect_rustls<'a, Input>(
+        &self,
         io: Input,
-        target: T,
-    ) -> Result<BufStream<TlsStream<Input>>, ProxyError>
+        target_addr: &TargetAddr<'a>,
+    ) -> Result<BufStream<RustlsTlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
         use rustls_platform_verifier::ConfigVerifierExt;
         use std::convert::TryFrom;
@@ -464,22 +513,21 @@ impl Proxy {
             .map_err(|e| ProxyError::AddressResolutionFailed(e.to_string()))?
             .to_owned();
 
-        let tls_connector = TlsConnector::from(std::sync::Arc::new(verifier));
+        let tls_connector = RustlsTlsConnector::from(std::sync::Arc::new(verifier));
         let stream = tls_connector.connect(domain, io).await?;
-        self.http_connect(stream, target).await
+        self.http_connect(stream, target_addr).await
     }
 
-    pub async fn http_connect<'a, Input, T>(
-        self,
+    pub async fn http_connect<'a, Input>(
+        &self,
         io: Input,
-        target: T,
+        target_addr: &TargetAddr<'a>,
     ) -> Result<BufStream<Input>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
-        T: IntoTargetAddr<'a>,
     {
         let mut stream = BufStream::new(io);
-        let (domain, port) = get_domain_and_port(target)?;
+        let (domain, port) = get_domain_and_port(target_addr)?;
 
         let request = self.make_request(&domain, port);
         stream.write_all(request.as_bytes()).await?;
@@ -504,13 +552,10 @@ impl Proxy {
     }
 }
 
-fn get_domain_and_port<'a, T: IntoTargetAddr<'a>>(target: T) -> Result<(String, u16), ProxyError> {
-    let target_addr = target
-        .into_target_addr()
-        .map_err(|e| ProxyError::TargetParseError(e.to_string()))?;
+fn get_domain_and_port<'a>(target_addr: &TargetAddr<'a>) -> Result<(String, u16), ProxyError> {
     match target_addr {
         tokio_socks::TargetAddr::Ip(addr) => Ok((addr.ip().to_string(), addr.port())),
-        tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), port)),
+        tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), *port)),
     }
 }
 
