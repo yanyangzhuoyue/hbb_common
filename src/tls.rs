@@ -5,6 +5,8 @@ use tokio_rustls::rustls::{
     DigitallySignedStruct, Error as TLSError, SignatureScheme,
 };
 
+use crate::config::allow_tls_danger_accept_invalid_certs;
+
 #[derive(Debug, Clone, Copy)]
 pub enum TlsType {
     Plain,
@@ -14,6 +16,7 @@ pub enum TlsType {
 
 lazy_static::lazy_static! {
     static ref URL_TLS_TYPE: RwLock<HashMap<String, TlsType>> = RwLock::new(HashMap::new());
+    static ref URL_TLS_DANGER_ACCEPT_INVALID_CERTS: RwLock<HashMap<String, bool>> = RwLock::new(HashMap::new());
 }
 
 // https://github.com/seanmonstar/reqwest/blob/fd61bc93e6f936454ce0b978c6f282f06eee9287/src/tls.rs#L608
@@ -79,7 +82,7 @@ pub fn is_plain(url: &str) -> bool {
 //       "https://example.com:8080/path" -> "example.com:8080"
 // See the tests for more examples.
 #[inline]
-fn get_domain_from_url(url: &str) -> &str {
+fn get_domain_and_port_from_url(url: &str) -> &str {
     // Remove scheme (e.g., http://, https://, ws://, wss://)
     let scheme_end = url.find("://").map(|pos| pos + 3).unwrap_or(0);
     let url2 = &url[scheme_end..];
@@ -99,11 +102,11 @@ pub fn upsert_tls_type(url: &str, tls_type: TlsType) {
         return;
     }
 
-    let domain = get_domain_from_url(url);
+    let domain_port = get_domain_and_port_from_url(url);
     URL_TLS_TYPE
         .write()
         .unwrap()
-        .insert(domain.to_string(), tls_type);
+        .insert(domain_port.to_string(), tls_type);
 }
 
 #[inline]
@@ -111,8 +114,8 @@ pub fn get_cached_tls_type(url: &str) -> Option<TlsType> {
     if is_plain(url) {
         return Some(TlsType::Plain);
     }
-    let domain = get_domain_from_url(url);
-    URL_TLS_TYPE.read().unwrap().get(domain).cloned()
+    let domain_port = get_domain_and_port_from_url(url);
+    URL_TLS_TYPE.read().unwrap().get(domain_port).cloned()
 }
 
 #[inline]
@@ -120,13 +123,48 @@ pub fn reset_tls_type_cache() {
     URL_TLS_TYPE.write().unwrap().clear();
 }
 
+#[inline]
+pub fn upsert_tls_accept_invalid_cert(url: &str, skip: bool) {
+    if is_plain(url) {
+        return;
+    }
+
+    let domain_port = get_domain_and_port_from_url(url);
+    URL_TLS_DANGER_ACCEPT_INVALID_CERTS
+        .write()
+        .unwrap()
+        .insert(domain_port.to_string(), skip);
+}
+
+#[inline]
+pub fn get_cached_tls_accept_invalid_cert(url: &str) -> Option<bool> {
+    if !allow_tls_danger_accept_invalid_certs() {
+        return Some(false);
+    }
+
+    if is_plain(url) {
+        return Some(false);
+    }
+    let domain_port = get_domain_and_port_from_url(url);
+    URL_TLS_DANGER_ACCEPT_INVALID_CERTS
+        .read()
+        .unwrap()
+        .get(domain_port)
+        .cloned()
+}
+
+#[inline]
+pub fn reset_tls_accept_invalid_cert_cache() {
+    URL_TLS_DANGER_ACCEPT_INVALID_CERTS.write().unwrap().clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_get_domain_from_url() {
-        for (url, expected_domain) in vec![
+    fn test_get_domain_and_port_from_url() {
+        for (url, expected_domain_port) in vec![
             ("http://example.com", "example.com"),
             ("https://example.com", "example.com"),
             ("ws://example.com/path", "example.com"),
@@ -138,8 +176,8 @@ mod tests {
             ("example.com/path", "example.com"),           // no scheme
             ("example.com:8080/path", "example.com:8080"),
         ] {
-            let domain = get_domain_from_url(url);
-            assert_eq!(domain, expected_domain);
+            let domain_port = get_domain_and_port_from_url(url);
+            assert_eq!(domain_port, expected_domain_port);
         }
     }
 }

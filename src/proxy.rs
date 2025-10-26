@@ -1,6 +1,7 @@
 use std::{
     io::Error as IoError,
     net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
 };
 
 use anyhow::bail;
@@ -10,7 +11,9 @@ use log::info;
 use thiserror::Error as ThisError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
 use tokio_native_tls::{native_tls, TlsConnector, TlsStream};
-use tokio_rustls::{client::TlsStream as RustlsTlsStream, TlsConnector as RustlsTlsConnector};
+use tokio_rustls::{
+    client::TlsStream as RustlsTlsStream, rustls::ClientConfig, TlsConnector as RustlsTlsConnector,
+};
 use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr, TargetAddr};
 use tokio_util::codec::Framed;
 use url::Url;
@@ -19,7 +22,10 @@ use crate::{
     bytes_codec::BytesCodec,
     config::Socks5Server,
     tcp::{DynTcpStream, FramedStream},
-    tls::{get_cached_tls_type, upsert_tls_type, TlsType},
+    tls::{
+        get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_accept_invalid_cert,
+        upsert_tls_type, NoVerifier, TlsType,
+    },
     ResultType,
 };
 
@@ -347,6 +353,20 @@ impl Proxy {
         self
     }
 
+    async fn new_stream(
+        &self,
+        local: SocketAddr,
+        proxy: SocketAddr,
+    ) -> ResultType<tokio::net::TcpStream> {
+        let stream = super::timeout(
+            self.ms_timeout,
+            crate::tcp::new_socket(local, true)?.connect(proxy),
+        )
+        .await??;
+        stream.set_nodelay(true).ok();
+        Ok(stream)
+    }
+
     pub async fn connect<'t, T>(
         &self,
         target: T,
@@ -355,7 +375,7 @@ impl Proxy {
     where
         T: IntoTargetAddr<'t>,
     {
-        info!("Connect to proxy server");
+        log::trace!("Connect to proxy server");
         let proxy = self.proxy_addrs().await?;
 
         let target_addr = target
@@ -368,18 +388,12 @@ impl Proxy {
             crate::config::Config::get_any_listen_addr(proxy.is_ipv4())
         };
 
-        let stream = super::timeout(
-            self.ms_timeout,
-            crate::tcp::new_socket(local, true)?.connect(proxy),
-        )
-        .await??;
-        stream.set_nodelay(true).ok();
-
+        let stream = self.new_stream(local, proxy).await?;
         let addr = stream.local_addr()?;
 
         return match self.intercept {
             ProxyScheme::Http { .. } => {
-                info!("Connect to remote http proxy server: {}", proxy);
+                log::trace!("Connect to remote http proxy server: {}", proxy);
                 let stream =
                     super::timeout(self.ms_timeout, self.http_connect(stream, &target_addr))
                         .await??;
@@ -391,52 +405,33 @@ impl Proxy {
                 ))
             }
             ProxyScheme::Https { .. } => {
-                info!("Connect to remote https proxy server: {}", proxy);
+                log::trace!("Connect to remote https proxy server: {}", proxy);
                 let url = format!("https://{}", self.intercept.get_host_and_port()?);
-                let tls_type = get_cached_tls_type(&url).unwrap_or(TlsType::NativeTls);
-                let ms_timeout = self.ms_timeout;
-                let stream = match tls_type {
+                let tls_type = get_cached_tls_type(&url);
+                let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(&url);
+                let stream = match tls_type.unwrap_or(TlsType::NativeTls) {
                     TlsType::NativeTls => {
-                        match super::timeout(
-                            ms_timeout,
-                            self.https_connect_nativetls(stream, &target_addr),
+                        self.https_connect_nativetls_wrap_danger(
+                            &url,
+                            local,
+                            proxy,
+                            Some(stream),
+                            &target_addr,
+                            tls_type.is_some(),
+                            danger_accept_invalid_cert,
+                            danger_accept_invalid_cert,
                         )
                         .await?
-                        {
-                            Ok(s) => {
-                                upsert_tls_type(&url, TlsType::NativeTls);
-                                DynTcpStream(Box::new(s))
-                            }
-                            Err(ProxyError::NativeTlsError(_)) => {
-                                log::warn!("Falling back to rustls for HTTPS proxy server.");
-                                let stream = super::timeout(
-                                    ms_timeout,
-                                    crate::tcp::new_socket(local, true)?.connect(proxy),
-                                )
-                                .await??;
-                                stream.set_nodelay(true).ok();
-                                let s = super::timeout(
-                                    ms_timeout,
-                                    self.https_connect_rustls(stream, &target_addr),
-                                )
-                                .await??;
-                                upsert_tls_type(&url, TlsType::Rustls);
-                                DynTcpStream(Box::new(s))
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to connect to HTTPS proxy server: {:?}.", e);
-                                bail!(e);
-                            }
-                        }
                     }
                     TlsType::Rustls => {
-                        let s = super::timeout(
-                            self.ms_timeout,
-                            self.https_connect_rustls(stream, &target_addr),
+                        self.https_connect_rustls_wrap_danger(
+                            &url,
+                            local,
+                            proxy,
+                            &target_addr,
+                            danger_accept_invalid_cert,
                         )
-                        .await??;
-                        upsert_tls_type(&url, tls_type);
-                        DynTcpStream(Box::new(s))
+                        .await?
                     }
                     _ => {
                         // Unreachable
@@ -451,7 +446,7 @@ impl Proxy {
                 ))
             }
             ProxyScheme::Socks5 { .. } => {
-                info!("Connect to remote socket5 proxy server: {}", proxy);
+                log::trace!("Connect to remote socket5 proxy server: {}", proxy);
                 let stream = if let Some(auth) = self.intercept.maybe_auth() {
                     super::timeout(
                         self.ms_timeout,
@@ -480,33 +475,138 @@ impl Proxy {
         };
     }
 
+    async fn https_connect_nativetls_wrap_danger<'a>(
+        &self,
+        url: &str,
+        local: SocketAddr,
+        proxy: SocketAddr,
+        stream: Option<tokio::net::TcpStream>,
+        target_addr: &TargetAddr<'a>,
+        is_tls_type_cached: bool,
+        danger_accept_invalid_cert: Option<bool>,
+        origin_danger_accept_invalid_cert: Option<bool>,
+    ) -> ResultType<DynTcpStream> {
+        let stream = stream.unwrap_or(self.new_stream(local, proxy).await?);
+        match super::timeout(
+            self.ms_timeout,
+            self.https_connect_nativetls(
+                stream,
+                target_addr,
+                danger_accept_invalid_cert.unwrap_or(false),
+            ),
+        )
+        .await?
+        {
+            Ok(s) => {
+                upsert_tls_type(&url, TlsType::NativeTls);
+                upsert_tls_accept_invalid_cert(&url, danger_accept_invalid_cert.unwrap_or(false));
+                Ok(DynTcpStream(Box::new(s)))
+            }
+            Err(ProxyError::NativeTlsError(e)) => {
+                let s = if danger_accept_invalid_cert.is_none() {
+                    log::warn!(
+                        "Falling back to nativetls (accept invalid cert) for HTTPS proxy server."
+                    );
+                    Box::pin(self.https_connect_nativetls_wrap_danger(
+                        &url,
+                        local,
+                        proxy,
+                        None,
+                        target_addr,
+                        is_tls_type_cached,
+                        Some(true),
+                        origin_danger_accept_invalid_cert,
+                    ))
+                    .await?
+                } else if !is_tls_type_cached {
+                    log::warn!("Falling back to rustls for HTTPS proxy server.");
+                    self.https_connect_rustls_wrap_danger(
+                        &url,
+                        local,
+                        proxy,
+                        &target_addr,
+                        origin_danger_accept_invalid_cert,
+                    )
+                    .await?
+                } else {
+                    log::error!(
+                        "Failed to connect to HTTPS proxy server with native-tls: {:?}.",
+                        e
+                    );
+                    bail!(e);
+                };
+                Ok(s)
+            }
+            Err(e) => {
+                log::error!("Failed to connect to HTTPS proxy server: {:?}.", e);
+                bail!(e);
+            }
+        }
+    }
+
     pub async fn https_connect_nativetls<'a, Input>(
         &self,
         io: Input,
         target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: bool,
     ) -> Result<BufStream<TlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
     {
-        let tls_connector = TlsConnector::from(native_tls::TlsConnector::new()?);
+        let mut tls_connector_builder = native_tls::TlsConnector::builder();
+        if danger_accept_invalid_cert {
+            tls_connector_builder.danger_accept_invalid_certs(true);
+        }
+        let tls_connector = TlsConnector::from(tls_connector_builder.build()?);
         let stream = tls_connector
             .connect(&self.intercept.get_domain()?, io)
             .await?;
         self.http_connect(stream, target_addr).await
     }
 
+    async fn https_connect_rustls_wrap_danger<'a>(
+        &self,
+        url: &str,
+        local: SocketAddr,
+        proxy: SocketAddr,
+        target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: Option<bool>,
+    ) -> ResultType<DynTcpStream> {
+        let stream = self.new_stream(local, proxy).await?;
+        let s = super::timeout(
+            self.ms_timeout,
+            self.https_connect_rustls(
+                stream,
+                &target_addr,
+                danger_accept_invalid_cert.unwrap_or(false),
+            ),
+        )
+        .await??;
+        upsert_tls_type(url, TlsType::Rustls);
+        upsert_tls_accept_invalid_cert(url, danger_accept_invalid_cert.unwrap_or(false));
+        Ok(DynTcpStream(Box::new(s)))
+    }
+
     pub async fn https_connect_rustls<'a, Input>(
         &self,
         io: Input,
         target_addr: &TargetAddr<'a>,
+        danger_accept_invalid_cert: bool,
     ) -> Result<BufStream<RustlsTlsStream<Input>>, ProxyError>
     where
         Input: AsyncRead + AsyncWrite + Unpin,
     {
         use rustls_platform_verifier::ConfigVerifierExt;
         use std::convert::TryFrom;
-        let verifier = tokio_rustls::rustls::ClientConfig::with_platform_verifier()
-            .map_err(|e| ProxyError::IoError(std::io::Error::other(e)))?;
+        let verifier = if danger_accept_invalid_cert {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth()
+        } else {
+            tokio_rustls::rustls::ClientConfig::with_platform_verifier()
+                .map_err(|e| ProxyError::IoError(std::io::Error::other(e)))?
+        };
         let url_domain = self.intercept.get_domain()?;
 
         let domain = rustls_pki_types::ServerName::try_from(url_domain.as_str())

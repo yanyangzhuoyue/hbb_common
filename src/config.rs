@@ -2413,6 +2413,16 @@ pub fn use_ws() -> bool {
     option2bool(option, &Config::get_option(option))
 }
 
+pub fn allow_tls_danger_accept_invalid_certs() -> bool {
+    let option = keys::OPTION_ALLOW_TLS_DANGER_ACCEPT_INVALID_CERTS;
+    BUILTIN_SETTINGS
+        .read()
+        .unwrap()
+        .get(option)
+        .map(|v| option2bool(option, v))
+        .unwrap_or(false)
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -2527,6 +2537,7 @@ pub mod keys {
     pub const OPTION_HIDE_PROXY_SETTINGS: &str = "hide-proxy-settings";
     pub const OPTION_HIDE_REMOTE_PRINTER_SETTINGS: &str = "hide-remote-printer-settings";
     pub const OPTION_HIDE_WEBSOCKET_SETTINGS: &str = "hide-websocket-settings";
+    pub const OPTION_ALLOW_TLS_DANGER_ACCEPT_INVALID_CERTS: &str = "allow-tls-danger-accept-invalid-certs";
 
     // Connection punch-through options
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
