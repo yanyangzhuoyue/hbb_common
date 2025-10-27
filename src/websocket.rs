@@ -1,26 +1,36 @@
 use crate::{
-    config::keys::OPTION_RELAY_SERVER,
-    config::{use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT},
+    config::{
+        keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
+    },
     protobuf::Message,
     socket_client::split_host_port,
     sodiumoxide::crypto::secretbox::Key,
     tcp::Encrypt,
+    tls::{
+        get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_accept_invalid_cert,
+        upsert_tls_type, NoVerifier, TlsType,
+    },
     ResultType,
 };
+use anyhow::bail;
 use bytes::{Bytes, BytesMut};
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use futures::future::{select_ok, FutureExt};
-use futures::{SinkExt, StreamExt};
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use std::future::Future;
+use futures::{
+    future::{select_ok, FutureExt},
+    SinkExt, StreamExt,
+};
+use rustls_platform_verifier::ConfigVerifierExt;
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{net::TcpStream, time::timeout};
+use tokio_native_tls::native_tls::{Error as NativeTlsError, TlsConnector};
+use tokio_rustls::rustls::{ClientConfig, Error as RustlsTLSError};
 use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
+    MaybeTlsStream, WebSocketStream,
 };
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Role;
@@ -32,91 +42,223 @@ pub struct WsFramedStream {
     send_timeout: u64,
 }
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
-async fn await_timeout_result<F, T, E>(future: F) -> ResultType<T>
-where
-    F: Future<Output = Result<Result<T, E>, tokio::time::error::Elapsed>>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    match future.await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(e.into()),
-        Err(elapsed) => Err(Error::new(ErrorKind::TimedOut, elapsed).into()),
-    }
-}
-
 impl WsFramedStream {
+    fn new_connector_native_tls(
+        danger_accept_invalid_certs: bool,
+    ) -> Result<TlsConnector, NativeTlsError> {
+        TlsConnector::builder()
+            .danger_accept_invalid_certs(danger_accept_invalid_certs)
+            .build()
+    }
+
+    fn new_connector_rustls(
+        danger_accept_invalid_certs: bool,
+    ) -> Result<Arc<ClientConfig>, RustlsTLSError> {
+        let config = if !danger_accept_invalid_certs {
+            ClientConfig::with_platform_verifier()?
+        } else {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth()
+        };
+        Ok(Arc::new(config))
+    }
+
+    #[inline]
+    fn get_connector(
+        tls_type: &TlsType,
+        danger_accept_invalid_certs: bool,
+    ) -> ResultType<Option<Connector>> {
+        match tls_type {
+            TlsType::Plain => Ok(Some(Connector::Plain)),
+            TlsType::NativeTls => {
+                let connector = Self::new_connector_native_tls(danger_accept_invalid_certs)?;
+                Ok(Some(Connector::NativeTls(connector)))
+            }
+            TlsType::Rustls => {
+                let connector = Self::new_connector_rustls(danger_accept_invalid_certs)?;
+                Ok(Some(Connector::Rustls(connector)))
+            }
+        }
+    }
+
+    async fn connect(
+        url: &str,
+        ms_timeout: u64,
+    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        // to-do: websocket proxy.
+
+        let tls_type = get_cached_tls_type(url);
+        let is_tls_type_cached = tls_type.is_some();
+        let tls_type = tls_type.unwrap_or(TlsType::NativeTls);
+        let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(&url);
+
+        if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+            Self::try_connect_mobile(
+                url,
+                ms_timeout,
+                tls_type,
+                is_tls_type_cached,
+                danger_accept_invalid_cert,
+                danger_accept_invalid_cert,
+            )
+            .await
+        } else {
+            Self::try_connect(
+                url,
+                ms_timeout,
+                tls_type,
+                is_tls_type_cached,
+                danger_accept_invalid_cert,
+                danger_accept_invalid_cert,
+            )
+            .await
+        }
+    }
+
+    async fn try_connect_mobile(
+        url: &str,
+        ms_timeout: u64,
+        tls_type: TlsType,
+        is_tls_type_cached: bool,
+        danger_accept_invalid_cert: Option<bool>,
+        original_danger_accept_invalid_certs: Option<bool>,
+    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let mut futures = vec![];
+        let is_wss = url.starts_with("wss://");
+        let rustls_platform_verifier_initialized = !cfg!(target_os = "android")
+            || crate::config::RUSTLS_PLATFORM_VERIFIER_INITIALIZED
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let try_rustls_tls = matches!(tls_type, TlsType::Rustls) || !is_tls_type_cached;
+        if try_rustls_tls && is_wss && rustls_platform_verifier_initialized {
+            futures.push(
+                Self::try_connect(
+                    url,
+                    ms_timeout,
+                    TlsType::Rustls,
+                    is_tls_type_cached,
+                    danger_accept_invalid_cert,
+                    original_danger_accept_invalid_certs,
+                )
+                .boxed(),
+            );
+        }
+        if matches!(tls_type, TlsType::NativeTls) || !is_tls_type_cached {
+            futures.push(
+                Self::try_connect(
+                    url,
+                    ms_timeout,
+                    tls_type,
+                    true,
+                    danger_accept_invalid_cert,
+                    original_danger_accept_invalid_certs,
+                )
+                .boxed(),
+            );
+        }
+        let (s, _) = select_ok(futures).await?;
+        Ok(s)
+    }
+
+    async fn try_connect(
+        url: &str,
+        ms_timeout: u64,
+        tls_type: TlsType,
+        is_tls_type_cached: bool,
+        danger_accept_invalid_cert: Option<bool>,
+        original_danger_accept_invalid_certs: Option<bool>,
+    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let ws_config = None;
+        let disable_nagle = false;
+        let request = url
+            .into_client_request()
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let connector =
+            Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
+        match timeout(
+            Duration::from_millis(ms_timeout),
+            connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
+        )
+        .await?
+        {
+            Ok((ws_stream, _)) => {
+                upsert_tls_type(url, tls_type);
+                upsert_tls_accept_invalid_cert(url, danger_accept_invalid_cert.unwrap_or(false));
+                Ok(ws_stream)
+            }
+            Err(e) => match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
+                (TlsType::NativeTls, _, None) => {
+                    log::warn!(
+                            "WebSocket connection with native-tls failed, try accept invalid certs: {}, {:?}",
+                            url,
+                            e
+                        );
+                    Box::pin(Self::try_connect(
+                        url,
+                        ms_timeout,
+                        tls_type,
+                        is_tls_type_cached,
+                        Some(true),
+                        original_danger_accept_invalid_certs,
+                    ))
+                    .await
+                }
+                (TlsType::NativeTls, false, Some(_)) => {
+                    log::warn!(
+                        "WebSocket connection with native-tls failed, try rustls: {}, {:?}",
+                        url,
+                        e
+                    );
+                    Box::pin(Self::try_connect(
+                        url,
+                        ms_timeout,
+                        TlsType::Rustls,
+                        is_tls_type_cached,
+                        original_danger_accept_invalid_certs,
+                        original_danger_accept_invalid_certs,
+                    ))
+                    .await
+                }
+                (TlsType::Rustls, _, None) => {
+                    log::warn!(
+                            "WebSocket connection with rustls failed, try accept invalid certs: {}, {:?}",
+                            url,
+                            e
+                        );
+                    Box::pin(Self::try_connect(
+                        url,
+                        ms_timeout,
+                        tls_type,
+                        is_tls_type_cached,
+                        Some(true),
+                        original_danger_accept_invalid_certs,
+                    ))
+                    .await
+                }
+                _ => {
+                    log::error!(
+                        "WebSocket connection failed with tls_type {:?}: {}, {:?}",
+                        tls_type,
+                        url,
+                        e
+                    );
+                    bail!(e)
+                }
+            },
+        }
+    }
+
     pub async fn new<T: AsRef<str>>(
         url: T,
         _local_addr: Option<SocketAddr>,
         _proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        let url_str = url.as_ref();
-
-        // to-do: websocket proxy.
-
-        let request = url_str
-            .into_client_request()
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-
-        let stream;
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            let mut futures = vec![];
-
-            let is_wss = url_str.starts_with("wss://");
-            let rustls_platform_verifier_initialized = !cfg!(target_os = "android")
-                || crate::config::RUSTLS_PLATFORM_VERIFIER_INITIALIZED
-                    .load(std::sync::atomic::Ordering::Relaxed);
-            if is_wss && rustls_platform_verifier_initialized {
-                use rustls_platform_verifier::ConfigVerifierExt;
-                use std::sync::Arc;
-                use tokio_rustls::rustls::ClientConfig;
-                use tokio_tungstenite::{connect_async_tls_with_config, Connector};
-                match ClientConfig::with_platform_verifier() {
-                    Ok(config) => {
-                        let connector = Connector::Rustls(Arc::new(config));
-                        futures.push(
-                            await_timeout_result(timeout(
-                                Duration::from_millis(ms_timeout),
-                                connect_async_tls_with_config(
-                                    request.clone(),
-                                    None,
-                                    false,
-                                    Some(connector),
-                                ),
-                            ))
-                            .boxed(),
-                        );
-                    }
-                    Err(e) => {
-                        log::error!("with_platform_verifier failed: {:?}", e);
-                    }
-                }
-            }
-            futures.push(
-                await_timeout_result(timeout(
-                    Duration::from_millis(ms_timeout),
-                    connect_async(request),
-                ))
-                .boxed(),
-            );
-            let ((s, _), _) = select_ok(futures).await?;
-            stream = s;
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            let (s, _) =
-                timeout(Duration::from_millis(ms_timeout), connect_async(request)).await??;
-            stream = s;
-        }
-
+        let stream = Self::connect(url.as_ref(), ms_timeout).await?;
         let addr = match stream.get_ref() {
             MaybeTlsStream::Plain(tcp) => tcp.peer_addr()?,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
             MaybeTlsStream::NativeTls(tls) => tls.get_ref().get_ref().get_ref().peer_addr()?,
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             MaybeTlsStream::Rustls(tls) => tls.get_ref().0.peer_addr()?,
             _ => return Err(Error::new(ErrorKind::Other, "Unsupported stream type").into()),
         };

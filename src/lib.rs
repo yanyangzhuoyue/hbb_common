@@ -61,6 +61,7 @@ pub mod stream;
 pub mod websocket;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use rustls_platform_verifier;
+pub mod tls;
 pub use stream::Stream;
 pub use whoami;
 
