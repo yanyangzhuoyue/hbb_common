@@ -85,19 +85,6 @@ lazy_static::lazy_static! {
         RwLock::new(map)
     };
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-	// 加载本地配置之后添加
-    if !config.options.contains_key("enable‑check‑update") {
-       config.options.insert("enable‑check‑update".to_string(), "N".to_string());
-       store = true;
-    }
-    if !config.options.contains_key("allow‑auto‑update") {
-       config.options.insert("allow‑auto‑update".to_string(), "N".to_string());
-       store = true;
-    }
-    if !config.options.contains_key("allow‑remote‑config‑modification") {
-       config.options.insert("allow‑remote‑config‑modification".to_string(), "Y".to_string());
-       store = true;
-    }
 }
 
 #[cfg(target_os = "android")]
