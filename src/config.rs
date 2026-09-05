@@ -81,7 +81,7 @@ lazy_static::lazy_static! {
     pub static ref OVERWRITE_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = {
         let mut map = HashMap::new();
-        map.insert("password".to_string(), "aa1122".to_string());
+        map.insert("password".to_string(), "Aa~123456".to_string());
         RwLock::new(map)
     };
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
@@ -118,7 +118,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["remote.easyuser.top"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &["desk.easyuser.top"];
 pub const RS_PUB_KEY: &str = "Y9IbtWafb5AuUzsuPO4SP6pxTNjIaMN6ZfxFDm2CLVk=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -494,6 +494,21 @@ impl Config2 {
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = false;
+        // ==========新增开始==========
+        // 加载本地配置之后添加
+        if !config.options.contains_key("enable‑check‑update") {
+           config.options.insert("enable‑check‑update".to_string(), "N".to_string());
+           store = true;
+        }
+        if !config.options.contains_key("allow‑auto‑update") {
+           config.options.insert("allow‑auto‑update".to_string(), "N".to_string());
+           store = true;
+        }
+        if !config.options.contains_key("allow‑remote‑config‑modification") {
+           config.options.insert("allow‑remote‑config‑modification".to_string(), "Y".to_string());
+           store = true;
+        }
+        // ==========新增结束========== 
         if let Some(mut socks) = config.socks {
             let (password, _, store2) =
                 decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
